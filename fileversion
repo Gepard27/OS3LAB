@@ -1,0 +1,310 @@
+#!/bin/bash
+
+STORE_DIR="${HOME}/.fileversions" 
+
+error() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+info() {
+    echo "$*"
+}
+
+require_jq() {
+    command -v jq >/dev/null 2>&1 || error "'jq' is not installed. Install it with: sudo yum install jq"
+}
+
+require_sha256() {
+    command -v sha256sum >/dev/null 2>&1 || error "'sha256sum' is not found."
+}
+
+store_for() {
+    local basename="$1"
+    echo "${STORE_DIR}/${basename}"
+}
+
+assert_initialized() {
+    local basename="$1"
+    local store
+    store="$(store_for "${basename}")"
+    [[ -d "${store}" ]] || error "Version control not initialized for '${basename}'. Run: fileversion init <path>"
+}
+
+get_inode() {
+    stat -L --format="%i" "$1" 2>/dev/null || error "Cannot stat '${1}'."
+}
+
+get_size() {
+    stat --format="%s" "$1" 2>/dev/null || echo 0
+}
+
+get_hash() {
+    sha256sum "$1" | awk '{print $1}'
+}
+
+now_ts() {
+    date "+%Y-%m-%d %H:%M:%S"
+}
+now_fn() {
+    date "+%Y-%m-%d_%H-%M-%S"
+}
+
+cmd_init() {
+    local filepath="${1:-}"
+    [[ -n "${filepath}" ]] || error "Usage: fileversion init <path_to_file>"
+
+    filepath="$(realpath -m "${filepath}")"
+
+    [[ -e "${filepath}" ]] || error "File not found: ${filepath}"
+    [[ -f "${filepath}" ]] || error "Not a regular file: ${filepath}"
+
+    require_jq
+    require_sha256
+
+    local basename
+    basename="$(basename "${filepath}")"
+
+    local store
+    store="$(store_for "${basename}")"
+
+    if [[ -d "${store}" ]]; then
+        error "Version control already initialized for '${basename}' (store: ${store})"
+    fi
+
+    mkdir -p "${store}/versions" || error "Cannot create store directory: ${store}/versions"
+
+    local inode size hash ts_human ts_fn
+    inode="$(get_inode "${filepath}")"
+    size="$(get_size "${filepath}")"
+    hash="$(get_hash "${filepath}")"
+    ts_human="$(now_ts)"
+    ts_fn="$(now_fn)"
+
+    local v_name="v1_${ts_fn}"
+
+    ln "${filepath}" "${store}/versions/${v_name}" \
+        || error "Cannot create hard link. Source and store must be on the same filesystem."
+
+    ( cd "${store}" && ln -sfT "versions/${v_name}" current_version ) \
+        || error "Cannot create current_version symlink."
+
+    jq -n \
+        --arg filename "${filepath}" \
+        --arg basename "${basename}" \
+        --arg vname "${v_name}" \
+        --arg ts "${ts_human}" \
+        --argjson inode "${inode}" \
+        --argjson size "${size}" \
+        --arg hash "sha256:${hash}" \
+        '{
+            filename: $filename,
+            basename: $basename,
+            versions: [
+                {
+                    id: 1,
+                    name: $vname,
+                    timestamp: $ts,
+                    inode: $inode,
+                    size: $size,
+                    comment: "Initial version",
+                    hash: $hash
+                }
+            ],
+            current_version: 1,
+            created: $ts,
+            last_updated: $ts
+        }' > "${store}/metadata.json" || error "Cannot write metadata.json"
+
+    info "Version control initialized for ${filepath}"
+}
+
+cmd_commit() {
+    local filepath="${1:-}"
+    local comment="${2:-}"
+    [[ -n "${filepath}" ]] || error "Usage: fileversion commit <path_to_file> [\"comment\"]"
+
+    filepath="$(realpath -m "${filepath}")"
+    [[ -e "${filepath}" ]] || error "File not found: ${filepath}"
+    [[ -f "${filepath}" ]] || error "Not a regular file: ${filepath}"
+
+    require_jq
+    require_sha256
+
+    local basename
+    basename="$(basename "${filepath}")"
+
+    assert_initialized "${basename}"
+
+    local store
+    store="$(store_for "${basename}")"
+
+    local meta="${store}/metadata.json"
+
+    local current_inode
+    current_inode="$(get_inode "${filepath}")"
+
+    local cv_link="${store}/current_version"
+    [[ -e "${cv_link}" ]] || error "current_version symlink missing in store. Store may be corrupt."
+    local stored_inode
+    stored_inode="$(get_inode "${cv_link}")"
+
+    if [[ "${current_inode}" == "${stored_inode}" ]]; then
+        info "No changes"
+        exit 0
+    fi
+
+    local existing_version=""
+    for f in "${store}/versions"/v*; do
+        [[ -e "${f}" ]] || continue
+        local f_inode
+        f_inode="$(get_inode "${f}")"
+        if [[ "${f_inode}" == "${current_inode}" ]]; then
+            existing_version="$(basename "${f}")"
+            break
+        fi
+    done
+
+    local next_id ts_human ts_fn v_name
+    next_id="$(jq '.versions | length + 1' "${meta}")"
+    ts_human="$(now_ts)"
+    ts_fn="$(now_fn)"
+    v_name="v${next_id}_${ts_fn}"
+
+    if [[ -n "${existing_version}" ]]; then
+        v_name="${existing_version}"
+        info "(note: inode already stored as ${existing_version}, reusing)"
+    else
+        ln "${filepath}" "${store}/versions/${v_name}" \
+            || error "Cannot create hard link. Source and store must be on the same filesystem."
+    fi
+
+    ( cd "${store}" && ln -sfT "versions/${v_name}" current_version ) \
+        || error "Cannot update current_version symlink."
+
+    local size hash
+    size="$(get_size "${filepath}")"
+    hash="$(get_hash "${filepath}")"
+    [[ -n "${comment}" ]] || comment="Version ${next_id}"
+
+    local tmp_meta
+    tmp_meta="$(mktemp)"
+    jq \
+        --argjson id "${next_id}" \
+        --arg vname "${v_name}" \
+        --arg ts "${ts_human}" \
+        --argjson inode "${current_inode}" \
+        --argjson size "${size}" \
+        --arg hash "sha256:${hash}" \
+        --arg comment "${comment}" \
+        '.versions += [{
+            id: $id,
+            name: $vname,
+            timestamp: $ts,
+            inode: $inode,
+            size: $size,
+            comment: $comment,
+            hash: $hash
+        }]
+        | .current_version = $id
+        | .last_updated = $ts' \
+        "${meta}" > "${tmp_meta}" && mv "${tmp_meta}" "${meta}" \
+        || { rm -f "${tmp_meta}"; error "Cannot update metadata.json"; }
+
+    info "Committed version ${next_id}: ${comment}"
+}
+
+cmd_restore() {
+    local filepath="${1:-}"
+    local version_arg="${2:-}"
+    [[ -n "${filepath}" ]] || error "Usage: fileversion restore <path_to_file> <version|latest>"
+    [[ -n "${version_arg}" ]] || error "Usage: fileversion restore <path_to_file> <version|latest>"
+
+    filepath="$(realpath -m "${filepath}")"
+
+    require_jq
+
+    local basename
+    basename="$(basename "${filepath}")"
+
+    assert_initialized "${basename}"
+
+    local store
+    store="$(store_for "${basename}")"
+    local meta="${store}/metadata.json"
+
+    local version_id
+    if [[ "${version_arg}" == "latest" ]]; then
+        version_id="$(jq '[.versions[].id] | max' "${meta}")"
+    else
+        if [[ "${version_arg}" =~ ^[0-9]+$ ]]; then
+            version_id="${version_arg}"
+        elif [[ "${version_arg}" =~ ^v([0-9]+)_ ]]; then
+            version_id="${BASH_REMATCH[1]}"
+        else
+            error "Cannot parse version argument: '${version_arg}'. Use a number, 'vN_...', or 'latest'."
+        fi
+    fi
+
+    local v_entry
+    v_entry="$(jq --argjson id "${version_id}" '.versions[] | select(.id == $id)' "${meta}")" \
+        || error "Cannot read metadata."
+    [[ -n "${v_entry}" ]] || error "Version ${version_id} not found in metadata."
+
+    local v_name
+    v_name="$(echo "${v_entry}" | jq -r '.name')"
+
+    local version_file="${store}/versions/${v_name}"
+    [[ -e "${version_file}" ]] || error "Version file missing: ${version_file}"
+
+    local parent_dir
+    parent_dir="$(dirname "${filepath}")"
+    [[ -d "${parent_dir}" ]] || error "Parent directory does not exist: ${parent_dir}"
+
+    if [[ -e "${filepath}" ]]; then
+        rm -- "${filepath}" || error "Cannot remove current file: ${filepath}"
+    fi
+
+    ln "${version_file}" "${filepath}" \
+        || error "Cannot create hard link from '${version_file}' to '${filepath}'. They must be on the same filesystem."
+
+    ( cd "${store}" && ln -sfT "versions/${v_name}" current_version ) \
+        || error "Cannot update current_version symlink."
+
+    local ts_human
+    ts_human="$(now_ts)"
+    local tmp_meta
+    tmp_meta="$(mktemp)"
+    jq \
+        --argjson id "${version_id}" \
+        --arg ts "${ts_human}" \
+        '.current_version = $id | .last_updated = $ts' \
+        "${meta}" > "${tmp_meta}" && mv "${tmp_meta}" "${meta}" \
+        || { rm -f "${tmp_meta}"; error "Cannot update metadata.json"; }
+
+    info "Checked out version ${version_id} to ${filepath}"
+}
+
+COMMAND="${1:-}"
+shift || true
+
+case "${COMMAND}" in
+    init)    cmd_init    "$@" ;;
+    commit)  cmd_commit  "$@" ;;
+    restore) cmd_restore "$@" ;;
+    *)
+        echo "Usage: fileversion <command> [args]"
+        echo ""
+        echo "Commands:"
+        echo "  init    <path_to_file>              Initialize version control for a file"
+        echo "  commit  <path_to_file> [\"comment\"]  Commit changes if the file inode changed"
+        echo "  restore <path_to_file> <version|latest>  Restore a specific version"
+        echo ""
+        echo "Examples:"
+        echo "  fileversion init ~/myfile.txt"
+        echo "  fileversion commit ~/myfile.txt \"Added intro paragraph\""
+        echo "  fileversion restore ~/myfile.txt 2"
+        echo "  fileversion restore ~/myfile.txt latest"
+        exit 1
+        ;;
+esac
